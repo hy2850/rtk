@@ -1,9 +1,11 @@
 //! Filters find results by grouping files by directory.
 
 use crate::core::tracking;
+use crate::core::runner;
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::Path;
 
 /// Match a filename against a glob pattern (supports `*` and `?`).
@@ -67,7 +69,7 @@ fn has_native_find_flags(args: &[String]) -> bool {
 const UNSUPPORTED_FIND_FLAGS: &[&str] = &[
     "-not", "!", "-or", "-o", "-and", "-a", "-exec", "-execdir", "-delete", "-print0", "-newer",
     "-perm", "-size", "-mtime", "-mmin", "-atime", "-amin", "-ctime", "-cmin", "-empty", "-link",
-    "-regex", "-iregex",
+    "-regex", "-iregex", "(", ")", "\\(", "\\)",
 ];
 
 fn has_unsupported_find_flags(args: &[String]) -> bool {
@@ -178,6 +180,11 @@ fn parse_rtk_find_args(args: &[String]) -> Result<FindArgs> {
 
 /// Entry point from main.rs — parses raw args then delegates to run().
 pub fn run_from_args(args: &[String], verbose: u8) -> Result<()> {
+    if has_unsupported_find_flags(args) {
+        run_native_find(args, verbose)?;
+        return Ok(());
+    }
+
     let parsed = parse_find_args(args)?;
     run(
         &parsed.pattern,
@@ -188,6 +195,11 @@ pub fn run_from_args(args: &[String], verbose: u8) -> Result<()> {
         parsed.case_insensitive,
         verbose,
     )
+}
+
+fn run_native_find(args: &[String], verbose: u8) -> Result<i32> {
+    let os_args: Vec<OsString> = args.iter().map(OsString::from).collect();
+    runner::run_passthrough("find", &os_args, verbose)
 }
 
 pub fn run(
@@ -507,6 +519,22 @@ mod tests {
     fn parse_native_find_rejects_exec() {
         let result = parse_find_args(&args(&[".", "-name", "*.tmp", "-exec", "rm", "{}", ";"]));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn run_from_args_unsupported_find_passthroughs_to_native_find() {
+        let result = run_from_args(
+            &args(&[
+                ".",
+                "-name",
+                "Cargo.toml",
+                "-o",
+                "-name",
+                "README.md",
+            ]),
+            0,
+        );
+        assert!(result.is_ok());
     }
 
     // --- parse_find_args: RTK syntax ---

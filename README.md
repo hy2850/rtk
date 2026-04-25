@@ -150,6 +150,8 @@ rtk grep "pattern" .            # Grouped search results
 rtk diff file1 file2            # Condensed diff
 ```
 
+Auto-rewrite preserves grep source semantics where needed, and leaves unsupported native `find` expressions unrewritten.
+
 ### Git
 ```bash
 rtk git status                  # Compact status

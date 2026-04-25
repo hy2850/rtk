@@ -103,11 +103,19 @@ test_rewrite "cat package.json" \
 
 test_rewrite "grep -rn pattern src/" \
   "grep -rn pattern src/" \
-  "rtk grep -rn pattern src/"
+  "rtk grep --source grep-bre -rn pattern src/"
 
 test_rewrite "rg pattern src/" \
   "rg pattern src/" \
-  "rtk grep pattern src/"
+  "rtk grep --source rg pattern src/"
+
+test_rewrite "grep BRE with literal paren" \
+  "grep -n 'reactor-core\\|jakarta.servlet-api\\|reactor-netty\\|compileOnly\\|api(' spring-webmvc/spring-webmvc.gradle" \
+  "rtk grep --source grep-bre -n 'reactor-core\\|jakarta.servlet-api\\|reactor-netty\\|compileOnly\\|api(' spring-webmvc/spring-webmvc.gradle"
+
+test_rewrite "find compound predicate stays raw" \
+  "find spring-webmvc/src/main/java/org/springframework/web/servlet -name 'HandlerMapping.java' -o -name 'HandlerAdapter.java' -o -name 'DispatcherServlet.java'" \
+  ""
 
 test_rewrite "cargo test" \
   "cargo test" \
@@ -263,13 +271,13 @@ test_rewrite "cargo test &>/dev/null" \
   "cargo test &>/dev/null" \
   "rtk cargo test &>/dev/null"
 
-# Note: the bash hook rewrites only the first command segment (sed-based);
-# full compound rewriting (both sides of &) is handled by `rtk rewrite` (Rust).
+# The shell hook delegates compound-command handling to `rtk rewrite` (Rust),
+# which rewrites both backgrounded segments when they are independently supported.
 # The critical behavior tested here: `&` after `cargo test` is NOT mistaken for
-# a redirect — the hook still rewrites cargo test, no crash.
-test_rewrite "cargo test & git status (bash hook rewrites first segment only)" \
+# a redirect, and background chaining still rewrites cleanly.
+test_rewrite "cargo test & git status (background chain rewrites both segments)" \
   "cargo test & git status" \
-  "rtk cargo test & git status"
+  "rtk cargo test & rtk git status"
 
 echo ""
 

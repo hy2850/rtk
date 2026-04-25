@@ -3,7 +3,7 @@
 use lazy_static::lazy_static;
 use regex::{Regex, RegexSet};
 
-use super::lexer::{split_on_operators, tokenize, TokenKind};
+use super::lexer::{shell_split, split_on_operators, tokenize, TokenKind};
 use super::rules::{IGNORED_EXACT, IGNORED_PREFIXES, RULES};
 
 /// Result of classifying a command.
@@ -679,32 +679,6 @@ fn rewrite_segment_inner(seg: &str, excluded: &[ExcludePattern], depth: usize) -
         return rewrite_line_range(cmd_part).map(|r| format!("{}{}", r, redirect_suffix));
     }
 
-    // Most cat flags (-v, -A, -e, -t, -s, -b, --show-all, etc.) have different
-    // semantics than rtk read or no equivalent at all. Only `-n` (line numbers)
-    // maps correctly to `rtk read -n`. Skip rewrite for any other flag.
-    if let Some(cmd_args) = cmd_part.strip_prefix("cat ") {
-        let args = cmd_args.trim_start();
-        if args.starts_with('-') && !args.starts_with("-n ") && !args.starts_with("-n\t") {
-            return None;
-        }
-    }
-
-    // Use classify_command for correct ignore/prefix handling
-    let rtk_equivalent = match classify_command(cmd_part) {
-        Classification::Supported { rtk_equivalent, .. } => {
-            let stripped = ENV_PREFIX.replace(cmd_part, "");
-            let cmd_clean = stripped.trim();
-            if is_excluded(cmd_clean, excluded) {
-                return None;
-            }
-            rtk_equivalent
-        }
-        _ => return None,
-    };
-
-    // Find the matching rule (rtk_cmd values are unique across all rules)
-    let rule = RULES.iter().find(|r| r.rtk_cmd == rtk_equivalent)?;
-
     // Extract env prefix (sudo, env VAR=val, etc.)
     let stripped_cow = ENV_PREFIX.replace(cmd_part, "");
     let env_prefix_len = cmd_part.len() - stripped_cow.len();
@@ -720,6 +694,37 @@ fn rewrite_segment_inner(seg: &str, excluded: &[ExcludePattern], depth: usize) -
         );
         return None;
     }
+
+    if is_excluded(cmd_clean, excluded) {
+        return None;
+    }
+
+    if let Some(rewritten) = rewrite_grep_command(env_prefix, cmd_clean, redirect_suffix) {
+        return Some(rewritten);
+    }
+
+    if find_requires_passthrough(cmd_clean) {
+        return None;
+    }
+
+    // Most cat flags (-v, -A, -e, -t, -s, -b, --show-all, etc.) have different
+    // semantics than rtk read or no equivalent at all. Only `-n` (line numbers)
+    // maps correctly to `rtk read -n`. Skip rewrite for any other flag.
+    if let Some(cmd_args) = cmd_part.strip_prefix("cat ") {
+        let args = cmd_args.trim_start();
+        if args.starts_with('-') && !args.starts_with("-n ") && !args.starts_with("-n\t") {
+            return None;
+        }
+    }
+
+    // Use classify_command for correct ignore/prefix handling
+    let rtk_equivalent = match classify_command(cmd_part) {
+        Classification::Supported { rtk_equivalent, .. } => rtk_equivalent,
+        _ => return None,
+    };
+
+    // Find the matching rule (rtk_cmd values are unique across all rules)
+    let rule = RULES.iter().find(|r| r.rtk_cmd == rtk_equivalent)?;
 
     if let Some(parts) = parse_golangci_run_parts(cmd_clean) {
         let rewritten = if parts.global_segment.is_empty() {
@@ -758,6 +763,71 @@ fn rewrite_segment_inner(seg: &str, excluded: &[ExcludePattern], depth: usize) -
     }
 
     None
+}
+
+fn rewrite_grep_command(env_prefix: &str, cmd_part: &str, redirect_suffix: &str) -> Option<String> {
+    let (source, rest) = if let Some(rest) = strip_word_prefix(cmd_part, "rg") {
+        ("rg", rest)
+    } else if let Some(rest) = strip_word_prefix(cmd_part, "egrep") {
+        ("grep-ere", rest)
+    } else if let Some(rest) = strip_word_prefix(cmd_part, "grep") {
+        ("grep-bre", rest)
+    } else {
+        return None;
+    };
+
+    let rewritten = if rest.is_empty() {
+        format!(
+            "{}rtk grep --source {}{}",
+            env_prefix, source, redirect_suffix
+        )
+    } else {
+        format!(
+            "{}rtk grep --source {} {}{}",
+            env_prefix, source, rest, redirect_suffix
+        )
+    };
+    Some(rewritten)
+}
+
+fn find_requires_passthrough(cmd_part: &str) -> bool {
+    let parts = shell_split(cmd_part);
+    if parts.first().map(String::as_str) != Some("find") {
+        return false;
+    }
+
+    parts.iter().skip(1).any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-not"
+                | "!"
+                | "-or"
+                | "-o"
+                | "-and"
+                | "-a"
+                | "-exec"
+                | "-execdir"
+                | "-delete"
+                | "-print0"
+                | "-newer"
+                | "-perm"
+                | "-size"
+                | "-mtime"
+                | "-mmin"
+                | "-atime"
+                | "-amin"
+                | "-ctime"
+                | "-cmin"
+                | "-empty"
+                | "-link"
+                | "-regex"
+                | "-iregex"
+                | "("
+                | ")"
+                | "\\("
+                | "\\)"
+        )
+    })
 }
 
 /// Strip a command prefix with word-boundary check.
@@ -1318,7 +1388,49 @@ mod tests {
     fn test_rewrite_rg_pattern() {
         assert_eq!(
             rewrite_command("rg \"fn main\"", &[]),
-            Some("rtk grep \"fn main\"".into())
+            Some("rtk grep --source rg \"fn main\"".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_grep_preserves_bre_source() {
+        assert_eq!(
+            rewrite_command(
+                r#"grep -n "reactor-core\|jakarta.servlet-api\|reactor-netty\|compileOnly\|api(" spring-webmvc/spring-webmvc.gradle"#,
+                &[],
+            ),
+            Some(
+                r#"rtk grep --source grep-bre -n "reactor-core\|jakarta.servlet-api\|reactor-netty\|compileOnly\|api(" spring-webmvc/spring-webmvc.gradle"#.into()
+            )
+        );
+    }
+
+    #[test]
+    fn test_rewrite_recursive_grep_normalizes_recursive_flag() {
+        assert_eq!(
+            rewrite_command(
+                r#"grep -r -n "HandlerExceptionResolver" spring-webmvc/src/main/java/org/springframework/web/servlet"#,
+                &[],
+            ),
+            Some(
+                r#"rtk grep --source grep-bre -r -n "HandlerExceptionResolver" spring-webmvc/src/main/java/org/springframework/web/servlet"#.into()
+            )
+        );
+    }
+
+    #[test]
+    fn test_rewrite_egrep_preserves_ere_source() {
+        assert_eq!(
+            rewrite_command(r#"egrep -n "foo|bar" src/main.rs"#, &[]),
+            Some(r#"rtk grep --source grep-ere -n "foo|bar" src/main.rs"#.into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_combined_recursive_grep_short_flags() {
+        assert_eq!(
+            rewrite_command("grep -rn pattern src/", &[]),
+            Some("rtk grep --source grep-bre -rn pattern src/".into())
         );
     }
 
@@ -1410,6 +1522,17 @@ mod tests {
         assert_eq!(
             rewrite_command("find . -name '*.rs'", &[]),
             Some("rtk find . -name '*.rs'".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_find_with_compound_predicate_passthrough() {
+        assert_eq!(
+            rewrite_command(
+                r#"find spring-webmvc/src/main/java/org/springframework/web/servlet -name "HandlerMapping.java" -o -name "HandlerAdapter.java" -o -name "DispatcherServlet.java""#,
+                &[],
+            ),
+            None
         );
     }
 

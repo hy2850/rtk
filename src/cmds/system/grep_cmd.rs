@@ -5,8 +5,22 @@ use crate::core::stream::exec_capture;
 use crate::core::tracking;
 use crate::core::utils::resolved_command;
 use anyhow::{Context, Result};
+use clap::ValueEnum;
 use regex::Regex;
 use std::collections::HashMap;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum GrepSource {
+    Rg,
+    GrepBre,
+    GrepEre,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SearchInvocation {
+    program: String,
+    args: Vec<String>,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -16,6 +30,10 @@ pub fn run(
     max_results: usize,
     context_only: bool,
     file_type: Option<&str>,
+    recursive: bool,
+    source: GrepSource,
+    extended_regexp: bool,
+    basic_regexp: bool,
     extra_args: &[String],
     verbose: u8,
 ) -> Result<i32> {
@@ -25,31 +43,16 @@ pub fn run(
         eprintln!("grep: '{}' in {}", pattern, path);
     }
 
-    // Fix: convert BRE alternation \| → | for rg (which uses PCRE-style regex)
-    let rg_pattern = pattern.replace(r"\|", "|");
-
-    let mut rg_cmd = resolved_command("rg");
-    rg_cmd.args(["-n", "--no-heading", &rg_pattern, path]);
-
-    if let Some(ft) = file_type {
-        rg_cmd.arg("--type").arg(ft);
-    }
-
-    for arg in extra_args {
-        // Fix: skip grep-ism -r flag (rg is recursive by default; rg -r means --replace)
-        if arg == "-r" || arg == "--recursive" {
-            continue;
-        }
-        rg_cmd.arg(arg);
-    }
-
-    let result = exec_capture(&mut rg_cmd)
-        .or_else(|_| {
-            let mut grep_cmd = resolved_command("grep");
-            grep_cmd.args(["-rn", pattern, path]);
-            exec_capture(&mut grep_cmd)
-        })
-        .context("grep/rg failed")?;
+    let effective_source = effective_source(source, extended_regexp, basic_regexp);
+    let invocation = build_search_invocation(
+        effective_source,
+        pattern,
+        path,
+        file_type,
+        recursive,
+        extra_args,
+    );
+    let result = execute_search(&invocation).context("grep/rg failed")?;
 
     let exit_code = result.exit_code;
     let raw_output = result.stdout.clone();
@@ -143,6 +146,68 @@ pub fn run(
     );
 
     Ok(exit_code)
+}
+
+fn effective_source(
+    source: GrepSource,
+    extended_regexp: bool,
+    basic_regexp: bool,
+) -> GrepSource {
+    if extended_regexp {
+        GrepSource::GrepEre
+    } else if basic_regexp {
+        GrepSource::GrepBre
+    } else {
+        source
+    }
+}
+
+fn build_search_invocation(
+    source: GrepSource,
+    pattern: &str,
+    path: &str,
+    file_type: Option<&str>,
+    recursive: bool,
+    extra_args: &[String],
+) -> SearchInvocation {
+    match source {
+        GrepSource::Rg => {
+            let mut args = vec!["-n".to_string(), "--no-heading".to_string()];
+            if let Some(ft) = file_type {
+                args.push("--type".to_string());
+                args.push(ft.to_string());
+            }
+            args.extend(extra_args.iter().cloned());
+            args.push(pattern.replace(r"\|", "|"));
+            args.push(path.to_string());
+            SearchInvocation {
+                program: "rg".to_string(),
+                args,
+            }
+        }
+        GrepSource::GrepBre | GrepSource::GrepEre => {
+            let mut args = vec!["-nH".to_string()];
+            if recursive {
+                args.push("-R".to_string());
+            }
+            if matches!(source, GrepSource::GrepEre) {
+                args.push("-E".to_string());
+            }
+            args.extend(extra_args.iter().cloned());
+            args.push(pattern.to_string());
+            args.push(path.to_string());
+            SearchInvocation {
+                program: "grep".to_string(),
+                args,
+            }
+        }
+    }
+}
+
+fn execute_search(invocation: &SearchInvocation) -> Result<crate::core::stream::CaptureResult> {
+    let mut cmd = resolved_command(&invocation.program);
+    cmd.args(&invocation.args);
+    exec_capture(&mut cmd)
 }
 
 fn clean_line(line: &str, max_len: usize, context_re: Option<&Regex>, pattern: &str) -> String {
@@ -270,6 +335,63 @@ mod tests {
             .collect();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0], "-i");
+    }
+
+    #[test]
+    fn test_bre_source_keeps_literal_parens() {
+        let invocation = build_search_invocation(
+            GrepSource::GrepBre,
+            r#"reactor-core\|jakarta.servlet-api\|reactor-netty\|compileOnly\|api("#,
+            "spring-webmvc/spring-webmvc.gradle",
+            None,
+            false,
+            &["-n".to_string()],
+        );
+        assert_eq!(invocation.program, "grep");
+        assert!(
+            invocation
+                .args
+                .iter()
+                .any(|arg| arg == r#"reactor-core\|jakarta.servlet-api\|reactor-netty\|compileOnly\|api("#)
+        );
+        assert!(!invocation.args.iter().any(|arg| arg == "|"));
+    }
+
+    #[test]
+    fn test_rg_source_strips_recursive_flag_but_keeps_compact_backend() {
+        let invocation = build_search_invocation(
+            GrepSource::Rg,
+            "HandlerExceptionResolver",
+            "spring-webmvc/src/main/java/org/springframework/web/servlet",
+            None,
+            true,
+            &["-n".to_string()],
+        );
+        assert_eq!(invocation.program, "rg");
+        assert!(!invocation.args.iter().any(|arg| arg == "-r" || arg == "-R"));
+        assert!(invocation.args.iter().any(|arg| arg == "HandlerExceptionResolver"));
+    }
+
+    #[test]
+    fn test_recursive_bre_source_uses_native_grep_recursion() {
+        let invocation = build_search_invocation(
+            GrepSource::GrepBre,
+            "HandlerExceptionResolver",
+            "spring-webmvc/src/main/java/org/springframework/web/servlet",
+            None,
+            true,
+            &["-n".to_string()],
+        );
+        assert_eq!(invocation.program, "grep");
+        assert!(invocation.args.iter().any(|arg| arg == "-R"));
+    }
+
+    #[test]
+    fn test_extended_regexp_flag_overrides_source_mode() {
+        assert_eq!(
+            effective_source(GrepSource::GrepBre, true, false),
+            GrepSource::GrepEre
+        );
     }
 
     // --- truncation accuracy ---

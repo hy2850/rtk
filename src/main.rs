@@ -299,6 +299,18 @@ enum Commands {
         /// Filter by file type (e.g., ts, py, rust)
         #[arg(short = 't', long)]
         file_type: Option<String>,
+        /// Recursive grep compatibility flag (-r / -R)
+        #[arg(short = 'r', short_alias = 'R', long, hide = true)]
+        recursive: bool,
+        /// Preserve source command regex semantics
+        #[arg(long, value_enum, default_value_t = grep_cmd::GrepSource::Rg, hide = true)]
+        source: grep_cmd::GrepSource,
+        /// GNU grep extended-regexp compatibility flag
+        #[arg(short = 'E', long = "extended-regexp", hide = true)]
+        extended_regexp: bool,
+        /// GNU grep basic-regexp compatibility flag
+        #[arg(short = 'G', long = "basic-regexp", hide = true)]
+        basic_regexp: bool,
         /// Show line numbers (always on, accepted for grep/rg compatibility)
         #[arg(short = 'n', long)]
         line_numbers: bool,
@@ -1690,6 +1702,10 @@ fn run_cli() -> Result<i32> {
             max,
             context_only,
             file_type,
+            recursive,
+            source,
+            extended_regexp,
+            basic_regexp,
             line_numbers: _, // no-op: line numbers always enabled in grep_cmd::run
             extra_args,
         } => grep_cmd::run(
@@ -1699,6 +1715,10 @@ fn run_cli() -> Result<i32> {
             max,
             context_only,
             file_type.as_deref(),
+            recursive,
+            source,
+            extended_regexp,
+            basic_regexp,
             &extra_args,
             cli.verbose,
         )?,
